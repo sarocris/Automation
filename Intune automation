@@ -1,0 +1,204 @@
+# Import Required Modules
+Install-Module -Name Microsoft.Graph.Intune -Force -Scope CurrentUser
+Import-Module Microsoft.Graph.Intune
+
+# Define Variables
+$TenantId = "your-tenant-id"
+$ClientId = "your-client-id"
+$ClientSecret = "your-client-secret"
+$WebhookUrl = "https://outlook.office.com/webhook/your-teams-webhook-url"
+$UpdateRingId = "your-update-ring-id"
+$SMTPServer = "smtp.office365.com"
+$SMTPPort = 587
+$EmailFrom = "admin@yourdomain.com"
+$EmailTo = "it-team@yourdomain.com"
+$EmailSubject = "Windows Update Status Report"
+
+# Function: Log Errors
+Function Log-Error {
+    param ($Message)
+    Write-Output "ERROR: $Message"
+}
+
+# Function: Get Graph API Token
+Function Get-GraphToken {
+    try {
+        $TokenUri = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+        $TokenBody = @{
+            grant_type    = "client_credentials"
+            client_id     = $ClientId
+            client_secret = $ClientSecret
+            scope         = "https://graph.microsoft.com/.default"
+        }
+        $TokenResponse = Invoke-RestMethod -Method Post -Uri $TokenUri -ContentType "application/x-www-form-urlencoded" -Body $TokenBody -ErrorAction Stop
+        return $TokenResponse.access_token
+    }
+    catch {
+        Log-Error "Failed to retrieve Graph API token. $_"
+        throw "Stopping script due to authentication failure."
+    }
+}
+
+# Authenticate with Graph API
+$AccessToken = Get-GraphToken
+$Headers = @{ Authorization = "Bearer $AccessToken"; "Content-Type" = "application/json" }
+
+# Function: Get Non-Compliant Devices
+Function Get-NonCompliantDevices {
+    try {
+        $DevicesUri = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$filter=complianceState ne 'compliant'"
+        $DevicesResponse = Invoke-RestMethod -Uri $DevicesUri -Headers $Headers -Method Get -ErrorAction Stop
+        return $DevicesResponse.value | Select-Object id, deviceName, operatingSystem, lastSyncDateTime
+    }
+    catch {
+        Log-Error "Failed to retrieve non-compliant devices. $_"
+        return @()
+    }
+}
+
+# Function: Get Devices Assigned to Update Ring
+Function Get-UpdateRingDevices {
+    try {
+        $UpdateRingUri = "https://graph.microsoft.com/v1.0/deviceManagement/deviceConfigurations/$UpdateRingId/assignments"
+        $UpdateRingResponse = Invoke-RestMethod -Uri $UpdateRingUri -Headers $Headers -Method Get -ErrorAction Stop
+        return $UpdateRingResponse.value
+    }
+    catch {
+        Log-Error "Failed to retrieve devices assigned to update ring. $_"
+        return @()
+    }
+}
+
+# Get Non-Compliant Devices
+$NonCompliantDevices = Get-NonCompliantDevices
+
+# Get Devices in the Specified Update Ring
+$AssignedDevices = Get-UpdateRingDevices
+
+# Filter Non-Compliant Devices by Update Ring
+$FilteredDevices = @()
+foreach ($Device in $NonCompliantDevices) {
+    if ($AssignedDevices -match $Device.id) {
+        $FilteredDevices += $Device
+    }
+}
+
+# Function: Deploy Remediation Script & Capture Pending Updates
+Function Deploy-Remediation {
+    param ($Device)
+
+    try {
+        $RemediationScript = @"
+            Install-Module PSWindowsUpdate -Force -AllowClobber
+            Import-Module PSWindowsUpdate
+            \$PendingUpdates = Get-WindowsUpdate -MicrosoftUpdate -IgnoreReboot -Verbose | Where-Object { \$_.Result -eq "Pending" }
+            if (\$PendingUpdates) {
+                \$PendingUpdates | ForEach-Object {
+                    Write-Output "Installing Update: \$_.Title"
+                    Install-WindowsUpdate -Title \$_.Title -AcceptAll -IgnoreReboot -Verbose
+                }
+            }
+            \$PendingUpdates | Select-Object Title, Result | ConvertTo-Csv -NoTypeInformation
+"@
+        $ScriptUri = "https://graph.microsoft.com/v1.0/deviceManagement/deviceManagementScripts"
+        $ScriptBody = @{
+            displayName  = "AutoPatch Pending Windows Updates (No Reboot)"
+            description  = "Installs only pending Windows Updates without forcing a reboot"
+            scriptContent = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($RemediationScript))
+            runAsAccount = "system"
+        } | ConvertTo-Json -Depth 3
+
+        $UpdateResponse = Invoke-RestMethod -Uri $ScriptUri -Headers $Headers -Method Post -Body $ScriptBody -ErrorAction Stop
+
+        return @{
+            DeviceName = $Device.deviceName
+            InstalledUpdates = $UpdateResponse
+        }
+    }
+    catch {
+        Log-Error "Failed to deploy remediation script for $($Device.deviceName). $_"
+        return $null
+    }
+}
+
+# Process Updates for Devices
+$UpdateResults = @()
+foreach ($Device in $FilteredDevices) {
+    $Result = Deploy-Remediation -Device $Device
+    if ($Result) {
+        $UpdateResults += $Result
+    }
+}
+
+# Function: Generate HTML Table
+Function Generate-HTMLTable {
+    param ($Data)
+
+    $HTML = "<html><head><style>
+                table { width: 100%; border-collapse: collapse; }
+                th, td { border: 1px solid black; padding: 8px; text-align: left; }
+                th { background-color: #4CAF50; color: white; }
+             </style></head><body>"
+    
+    $HTML += "<h2>Windows Update Report</h2>"
+    $HTML += "<table><tr><th>Device Name</th><th>Patch Name</th><th>Status</th></tr>"
+
+    foreach ($Item in $Data) {
+        foreach ($Update in $Item.InstalledUpdates) {
+            $HTML += "<tr><td>$($Item.DeviceName)</td><td>$($Update.Title)</td><td>$($Update.Result)</td></tr>"
+        }
+    }
+
+    $HTML += "</table></body></html>"
+    return $HTML
+}
+
+# Function: Convert Report to CSV
+Function ConvertTo-CSV {
+    param ($Data)
+    $CSV = "Device Name,Patch Name,Status`n"
+    foreach ($Item in $Data) {
+        foreach ($Update in $Item.InstalledUpdates) {
+            $CSV += "$($Item.DeviceName),$($Update.Title),$($Update.Result)`n"
+        }
+    }
+    return $CSV
+}
+
+# Send HTML Report to Teams
+Function Send-TeamsReport {
+    $HTMLReport = Generate-HTMLTable -Data $UpdateResults
+    try {
+        $Payload = @{
+            title = "Windows Update Status Report"
+            text  = $HTMLReport
+        } | ConvertTo-Json -Depth 3
+
+        Invoke-RestMethod -Uri $WebhookUrl -Method Post -ContentType "application/json" -Body $Payload -ErrorAction Stop
+    }
+    catch {
+        Log-Error "Failed to send report to Teams. $_"
+    }
+}
+
+# Send CSV Report via Email
+Function Send-EmailReport {
+    $CSVData = ConvertTo-CSV -Data $UpdateResults
+    $SMTPMessage = @{
+        From       = $EmailFrom
+        To         = $EmailTo
+        Subject    = $EmailSubject
+        Body       = "Please find the attached Windows Update report."
+        BodyAsHtml = $false
+        Attachments = @{ Name = "WindowsUpdateReport.csv"; Content = [System.Text.Encoding]::UTF8.GetBytes($CSVData) }
+        SmtpServer = $SMTPServer
+        Port       = $SMTPPort
+        UseSsl     = $true
+    }
+    Send-MailMessage @SMTPMessage
+}
+
+Send-TeamsReport
+Send-EmailReport
+
+Write-Output "Update process completed successfully."
