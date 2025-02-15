@@ -1,0 +1,102 @@
+# PowerShell Script to Check SSL Certificate Expiry and Send Report via Microsoft Graph API
+
+param (
+    [string]$TenantId = "<Your-Tenant-ID>",
+    [string]$ClientId = "<Your-Client-ID>",
+    [string]$ClientSecret = "<Your-Client-Secret>",
+    [string]$SenderEmail = "your_email@domain.com",
+    [array]$AdminEmails = @("admin1@domain.com", "admin2@domain.com")
+)
+
+# Microsoft Graph API URLs
+$GraphTokenUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+$GraphServicePrincipalsUrl = "https://graph.microsoft.com/v1.0/servicePrincipals"
+
+# Function to Get Access Token for Microsoft Graph API
+function Get-GraphAccessToken {
+    $body = @{
+        grant_type    = "client_credentials"
+        client_id     = $ClientId
+        client_secret = $ClientSecret
+        scope         = "https://graph.microsoft.com/.default"
+    }
+    
+    $response = Invoke-RestMethod -Method Post -Uri $GraphTokenUrl -Body $body
+    return $response.access_token
+}
+
+# Function to Get Enterprise Applications from Microsoft Entra
+function Get-EnterpriseApplications {
+    $AccessToken = Get-GraphAccessToken
+    $Headers = @{ "Authorization" = "Bearer $AccessToken" }
+    $Apps = Invoke-RestMethod -Method Get -Uri $GraphServicePrincipalsUrl -Headers $Headers
+
+    return $Apps.value
+}
+
+# Function to Check SSL Certificate Expiry
+function Check-CertificateExpiry($hostname) {
+    try {
+        $TcpClient = New-Object System.Net.Sockets.TcpClient
+        $TcpClient.Connect($hostname, 443)
+        $Stream = $TcpClient.GetStream()
+        $SslStream = New-Object System.Net.Security.SslStream($Stream, $false)
+        $SslStream.AuthenticateAsClient($hostname)
+        $Cert = $SslStream.RemoteCertificate
+        $ExpiryDate = [datetime]$Cert.GetExpirationDateString()
+
+        $TcpClient.Close()
+        return $ExpiryDate
+    }
+    catch {
+        return "Error: $_"
+    }
+}
+
+# Generate Certificate Expiry Report
+$Report = "🔔 **Certificate Expiry Report** 🔔`n`n"
+$Apps = Get-EnterpriseApplications
+
+foreach ($App in $Apps) {
+    $AppName = $App.appDisplayName
+    $Host = $App.servicePrincipalNames | Select-String -Pattern "https://" | Select-Object -First 1
+
+    if ($Host) {
+        $Hostname = $Host -replace "https://", "" -replace "/.*", ""
+        $ExpiryDate = Check-CertificateExpiry($Hostname)
+
+        if ($ExpiryDate -is [datetime]) {
+            $DaysRemaining = ($ExpiryDate - (Get-Date)).Days
+            $Report += "✔️ **$AppName** - SSL Expiry: **$ExpiryDate** ($DaysRemaining days left)`n"
+        } else {
+            $Report += "⚠️ **$AppName** - Unable to check SSL expiry: $ExpiryDate`n"
+        }
+    } else {
+        $Report += "❌ **$AppName** - No valid hostname found`n"
+    }
+}
+
+# Function to Send Email via Microsoft Graph API
+function Send-GraphEmail {
+    $AccessToken = Get-GraphAccessToken
+    $Headers = @{
+        "Authorization" = "Bearer $AccessToken"
+        "Content-Type"  = "application/json"
+    }
+
+    $EmailBody = @{
+        message = @{
+            subject      = "🚨 SSL Certificate Expiry Report"
+            body         = @{ contentType = "Text"; content = $Report }
+            toRecipients = $AdminEmails | ForEach-Object { @{ emailAddress = @{ address = $_ } } }
+        }
+    } | ConvertTo-Json -Depth 10
+
+    $SendMailUrl = "https://graph.microsoft.com/v1.0/users/$SenderEmail/sendMail"
+    Invoke-RestMethod -Method Post -Uri $SendMailUrl -Headers $Headers -Body $EmailBody
+}
+
+# Send Report via Email
+Send-GraphEmail
+
+Write-Output "✅ SSL Certificate Expiry Report Sent Successfully!"
