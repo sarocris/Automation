@@ -1,0 +1,247 @@
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# Create the main form
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "OneDrive Migration Tool"
+$form.Size = New-Object System.Drawing.Size(600, 400)
+$form.StartPosition = "CenterScreen"
+
+# Global variables
+$isCancelled = $false
+$logFile = "$env:USERPROFILE\OneDriveMigrationLog.txt"
+$progressBars = @{}
+$labels = @{}
+
+# Function to log messages
+function Log-Message {
+    param ([string]$message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "$timestamp - $message"
+    Add-Content -Path $logFile -Value $logMessage
+}
+
+# Function to calculate OneDrive space left
+function Get-OneDriveSpaceLeft {
+    param ([string]$OneDrivePath)
+    $drive = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -eq (Split-Path -Path $OneDrivePath -Qualifier) + "\" }
+    if ($drive) {
+        $freeSpace = $drive.Free
+        $totalSpace = $drive.Used + $drive.Free
+        return [math]::Round(($freeSpace / $totalSpace) * 100, 2)
+    }
+    return 0
+}
+
+# Function to create progress bars and labels
+function Create-ProgressUI {
+    param (
+        [string]$dataType,
+        [int]$yPosition
+    )
+    # Progress bar
+    $progressBar = New-Object System.Windows.Forms.ProgressBar
+    $progressBar.Location = New-Object System.Drawing.Point(50, $yPosition)
+    $progressBar.Size = New-Object System.Drawing.Size(400, 20)
+    $progressBar.Style = "Continuous"
+    $form.Controls.Add($progressBar)
+    $progressBars[$dataType] = $progressBar
+
+    # Label for progress
+    $label = New-Object System.Windows.Forms.Label
+    $label.Location = New-Object System.Drawing.Point(460, $yPosition)
+    $label.Size = New-Object System.Drawing.Size(100, 20)
+    $label.Text = "0/0"
+    $form.Controls.Add($label)
+    $labels[$dataType] = $label
+}
+
+# Function to copy files to OneDrive with retries
+function Copy-ToOneDrive {
+    param (
+        [string]$SourcePath,
+        [string]$OneDrivePath,
+        [string]$dataType
+    )
+    # Ensure OneDrive directory exists
+    if (-not (Test-Path $OneDrivePath)) {
+        New-Item -ItemType Directory -Path $OneDrivePath | Out-Null
+    }
+
+    # Get all files in the source directory
+    $files = Get-ChildItem -Path $SourcePath -Recurse -File
+    $totalFiles = $files.Count
+    $copiedFiles = 0
+
+    foreach ($file in $files) {
+        if ($isCancelled) {
+            Log-Message "Migration cancelled by user."
+            break
+        }
+
+        $relativePath = $file.FullName.Substring($SourcePath.Length)
+        $destinationPath = Join-Path -Path $OneDrivePath -ChildPath $relativePath
+
+        # Ensure the destination directory exists
+        $destinationDir = Split-Path -Path $destinationPath -Parent
+        if (-not (Test-Path $destinationDir)) {
+            New-Item -ItemType Directory -Path $destinationDir | Out-Null
+        }
+
+        # Retry mechanism for file copy
+        $retryCount = 3
+        $retryDelay = 2 # seconds
+        $success = $false
+
+        for ($i = 1; $i -le $retryCount; $i++) {
+            try {
+                Copy-Item -Path $file.FullName -Destination $destinationPath -Force
+                $success = $true
+                break
+            } catch {
+                Log-Message "Failed to copy $($file.FullName) (Attempt $i): $_"
+                Start-Sleep -Seconds $retryDelay
+            }
+        }
+
+        if (-not $success) {
+            Log-Message "Failed to copy $($file.FullName) after $retryCount attempts."
+            continue
+        }
+
+        $copiedFiles++
+        $progressBars[$dataType].Value = ($copiedFiles / $totalFiles) * 100
+        $labels[$dataType].Text = "$copiedFiles/$totalFiles"
+        [System.Windows.Forms.Application]::DoEvents() # Update the GUI
+    }
+}
+
+# Function to migrate browser data (bookmarks and cache)
+function Migrate-BrowserData {
+    param (
+        [string]$OneDrivePath
+    )
+    $browsers = @(
+        @{ Name = "Chrome"; BookmarkPath = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Bookmarks"; CachePath = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Cache" },
+        @{ Name = "Edge"; BookmarkPath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Bookmarks"; CachePath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Cache" },
+        @{ Name = "Firefox"; BookmarkPath = "$env:APPDATA\Mozilla\Firefox\Profiles\*.default-release\places.sqlite"; CachePath = "$env:APPDATA\Mozilla\Firefox\Profiles\*.default-release\cache2" }
+    )
+
+    foreach ($browser in $browsers) {
+        $browserName = $browser.Name
+        $bookmarkPath = $browser.BookmarkPath
+        $cachePath = $browser.CachePath
+
+        # Migrate bookmarks
+        if (Test-Path $bookmarkPath)) {
+            $bookmarkDest = Join-Path -Path $OneDrivePath -ChildPath "BrowserData\$browserName\Bookmarks"
+            New-Item -ItemType Directory -Path (Split-Path -Path $bookmarkDest) -Force | Out-Null
+            Copy-Item -Path $bookmarkPath -Destination $bookmarkDest -Force
+            Log-Message "Copied $browserName bookmarks to $bookmarkDest"
+        }
+
+        # Migrate cache
+        if (Test-Path $cachePath)) {
+            $cacheDest = Join-Path -Path $OneDrivePath -ChildPath "BrowserData\$browserName\Cache"
+            New-Item -ItemType Directory -Path $cacheDest -Force | Out-Null
+            Copy-Item -Path $cachePath -Destination $cacheDest -Recurse -Force
+            Log-Message "Copied $browserName cache to $cacheDest"
+        }
+    }
+}
+
+# Function to start the migration
+function Start-Migration {
+    # Disable the start button and enable the cancel button
+    $startButton.Enabled = $false
+    $cancelButton.Enabled = $true
+    $isCancelled = $false
+
+    # Define source directories
+    $userProfile = [Environment]::GetFolderPath("UserProfile")
+    $sourceDirs = @(
+        @{ Path = [Environment]::GetFolderPath("Desktop"); DataType = "Desktop" },
+        @{ Path = [Environment]::GetFolderPath("MyDocuments"); DataType = "Documents" },
+        @{ Path = [Environment]::GetFolderPath("MyDownloads"); DataType = "Downloads" },
+        @{ Path = [Environment]::GetFolderPath("MyPictures"); DataType = "Pictures" },
+        @{ Path = "$env:LOCALAPPDATA"; DataType = "AppData" }
+    )
+
+    # Define OneDrive destination directory
+    $oneDriveDir = Join-Path -Path $userProfile -ChildPath "OneDrive"
+
+    # Validate OneDrive directory
+    if (-not (Test-Path $oneDriveDir)) {
+        [System.Windows.Forms.MessageBox]::Show("OneDrive directory not found. Please ensure OneDrive is set up.", "Error")
+        return
+    }
+
+    # Copy files from each source directory to OneDrive
+    foreach ($sourceDir in $sourceDirs) {
+        if (Test-Path $sourceDir.Path)) {
+            Log-Message "Copying files from $($sourceDir.Path) to OneDrive..."
+            Copy-ToOneDrive -SourcePath $sourceDir.Path -OneDrivePath $oneDriveDir -DataType $sourceDir.DataType
+        } else {
+            Log-Message "Source directory not found: $($sourceDir.Path)"
+        }
+    }
+
+    # Migrate browser data (bookmarks and cache)
+    Migrate-BrowserData -OneDrivePath $oneDriveDir
+
+    # Update OneDrive space left
+    $spaceLeft = Get-OneDriveSpaceLeft -OneDrivePath $oneDriveDir
+    $spaceLabel.Text = "Space Left: $spaceLeft%"
+
+    # Re-enable the start button and disable the cancel button
+    $startButton.Enabled = $true
+    $cancelButton.Enabled = $false
+
+    if ($isCancelled) {
+        [System.Windows.Forms.MessageBox]::Show("Migration cancelled by user.", "Cancelled")
+    } else {
+        [System.Windows.Forms.MessageBox]::Show("Migration completed successfully!", "Success")
+    }
+}
+
+# Create progress bars and labels for each data type
+$yPosition = 50
+$dataTypes = @("Desktop", "Documents", "Downloads", "Pictures", "AppData", "BrowserData")
+foreach ($dataType in $dataTypes) {
+    Create-ProgressUI -dataType $dataType -yPosition $yPosition
+    $yPosition += 30
+}
+
+# Create a label for OneDrive space left
+$spaceLabel = New-Object System.Windows.Forms.Label
+$spaceLabel.Location = New-Object System.Drawing.Point(50, $yPosition)
+$spaceLabel.Size = New-Object System.Drawing.Size(400, 20)
+$spaceLabel.Text = "Space Left: 100%"
+$form.Controls.Add($spaceLabel)
+
+# Create a button to start the migration
+$startButton = New-Object System.Windows.Forms.Button
+$startButton.Location = New-Object System.Drawing.Point(150, $yPosition + 30)
+$startButton.Size = New-Object System.Drawing.Size(100, 30)
+$startButton.Text = "Start Migration"
+$form.Controls.Add($startButton)
+
+# Create a cancel button
+$cancelButton = New-Object System.Windows.Forms.Button
+$cancelButton.Location = New-Object System.Drawing.Point(270, $yPosition + 30)
+$cancelButton.Size = New-Object System.Drawing.Size(100, 30)
+$cancelButton.Text = "Cancel"
+$cancelButton.Enabled = $false
+$form.Controls.Add($cancelButton)
+
+# Add click event to the start button
+$startButton.Add_Click({ Start-Migration })
+
+# Add click event to the cancel button
+$cancelButton.Add_Click({
+    $isCancelled = $true
+    $cancelButton.Enabled = $false
+})
+
+# Show the form
+$form.ShowDialog()
