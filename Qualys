@@ -1,0 +1,146 @@
+# Define Variables
+param (
+    [string]$QualysAPI = "https://qualysapi.example.com",  # Update with the correct API URL
+    [string]$IntuneGraphAPI = "https://graph.microsoft.com/v1.0/deviceManagement",  # Microsoft Graph API for Intune
+    [string]$TeamsWebhookURL = "https://teams.webhook.url",  # Update with Teams Webhook URL for admin notifications
+    [string]$GraphTeamsAPI = "https://graph.microsoft.com/v1.0/chats",  # Microsoft Graph API for Teams direct messaging
+    [string]$EmailAPI = "https://email.api.example.com/send",  # Email notification API endpoint
+    [string]$QualysToken,
+    [string]$IntuneToken,
+    [string]$GraphToken,  # Microsoft Graph API Token
+    [string]$EmailRecipients = "admin@example.com"
+)
+
+# Function to fetch non-compliant devices from Qualys with pagination
+function Get-NonCompliantDevices {
+    $Headers = @{ Authorization = "Bearer $QualysToken" }
+    $Devices = @()
+    $Page = 1
+    $PageSize = 50
+    
+    do {
+        $Response = Invoke-RestMethod -Uri "$QualysAPI/noncompliant-devices?page=$Page&pageSize=$PageSize" -Headers $Headers -Method Get
+        $Devices += $Response.devices
+        $Page++
+    } while ($Response.devices.Count -eq $PageSize)
+    
+    return $Devices
+}
+
+# Function to deploy Intune remediation script
+function Deploy-IntuneRemediation {
+    param ([string]$DeviceID)
+
+    $RemediationScript = @"
+    Install-PackageProvider -Name NuGet -Force
+    Install-Module -Name PSWindowsUpdate -Force -Confirm:\$false
+    Import-Module PSWindowsUpdate
+    Get-WindowsUpdate -Install -AcceptAll -IgnoreReboot
+    "@
+
+    $Body = @{
+        "deviceId" = $DeviceID
+        "scriptContent" = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($RemediationScript))
+    } | ConvertTo-Json -Depth 10
+
+    Invoke-RestMethod -Uri "$IntuneGraphAPI/scripts/deploy" -Headers @{Authorization="Bearer $IntuneToken"} -Body $Body -Method Post
+}
+
+# Function to determine off-business hours based on user's local timezone
+function Get-OffBusinessHours {
+    param ([string]$TimeZone)
+    
+    # Assume standard business hours are 9 AM - 6 PM local time
+    $CurrentTime = [System.TimeZoneInfo]::ConvertTimeBySystemTimeZoneId((Get-Date), $TimeZone)
+    $BusinessEndTime = Get-Date -Hour 18 -Minute 0 -Second 0 -Format "HH:mm"
+    
+    return $BusinessEndTime
+}
+
+# Function to send report to Teams
+function Send-TeamsReport {
+    param ([string]$ReportContent)
+    $Body = @{ text = $ReportContent } | ConvertTo-Json
+    Invoke-RestMethod -Uri $TeamsWebhookURL -Method Post -Body $Body -ContentType "application/json"
+}
+
+# Function to send direct Teams message to users with restart options
+function Notify-UserDirectly {
+    param ([string]$UserEmail, [string]$DeviceName, [string]$TimeZone)
+    $Headers = @{ "Authorization" = "Bearer $GraphToken"; "Content-Type" = "application/json" }
+    
+    # Fetch user chat ID
+    $UserResponse = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$UserEmail/chats" -Headers $Headers -Method Get
+    $ChatID = $UserResponse.value[0].id
+    
+    # Get local off-business hours restart time
+    $RestartTime = Get-OffBusinessHours -TimeZone $TimeZone
+    
+    # Construct interactive message with buttons
+    $Message = @"
+    **Installation completed on your device ($DeviceName).**
+    Please restart your machine to stay compliant.
+    "@
+    
+    $Body = @{
+        "body" = @{ "content" = $Message }
+        "attachments" = @(
+            @{ "contentType" = "application/vnd.microsoft.card.hero";
+                "content" = @{
+                    "title" = "Restart Options"
+                    "buttons" = @(
+                        @{ "type" = "messageBack"; "title" = "Restart Now"; "value" = "restart_now" },
+                        @{ "type" = "messageBack"; "title" = "Restart After Business Hours ($RestartTime)"; "value" = "restart_after_hours" }
+                    )
+                }
+            }
+        )
+    } | ConvertTo-Json -Depth 10
+    
+    Invoke-RestMethod -Uri "$GraphTeamsAPI/$ChatID/messages" -Method Post -Headers $Headers -Body $Body
+}
+
+# Function to handle user response
+function Handle-UserResponse {
+    param ([string]$UserEmail, [string]$Response, [string]$TimeZone)
+    
+    if ($Response -eq "restart_now") {
+        Restart-Computer -Force
+    } elseif ($Response -eq "restart_after_hours") {
+        $RestartTime = Get-OffBusinessHours -TimeZone $TimeZone
+        Write-Host "User $UserEmail chose to restart after business hours at $RestartTime. Scheduled restart."
+        Start-Sleep -Seconds (([datetime]::Parse($RestartTime) - (Get-Date)).TotalSeconds)
+        Restart-Computer -Force
+    }
+}
+
+# Function to send email notification
+function Send-EmailNotification {
+    param ([string]$Subject, [string]$BodyContent)
+    $EmailBody = @{
+        "subject" = $Subject
+        "body" = $BodyContent
+        "recipients" = @( $EmailRecipients -split "," )
+    } | ConvertTo-Json
+
+    Invoke-RestMethod -Uri $EmailAPI -Method Post -Body $EmailBody -Headers @{"Content-Type"="application/json"}
+}
+
+# Main Execution
+$NonCompliantDevices = Get-NonCompliantDevices
+$Report = ""
+foreach ($Device in $NonCompliantDevices) {
+    $Report += "Remediating device: $($Device.name) - $($Device.id)`n"
+    Deploy-IntuneRemediation -DeviceID $Device.id
+    
+    # Notify user directly in Teams with restart options
+    if ($Device.userEmail -and $Device.timeZone) {
+        Notify-UserDirectly -UserEmail $Device.userEmail -DeviceName $Device.name -TimeZone $Device.timeZone
+    }
+}
+
+# Send the compliance report
+Send-TeamsReport -ReportContent "Windows update remediation completed. Devices patched: `n$Report"
+
+# Send an email notification
+Send-EmailNotification -Subject "Windows Update Remediation Report" -BodyContent "Remediation completed. Details: `n$Report"
